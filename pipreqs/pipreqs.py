@@ -6,19 +6,26 @@ Usage:
     pipreqs [options] <path>
 
 Options:
-    --use-local         Use ONLY local package info instead of querying PyPI
-    --pypi-server       Use custom PyPi server
-    --proxy             Use Proxy, parameter will be passed to requests library
-    --debug             Print debug information
-    --savepath <file>   Save the list of requirements in the given file
-    --force             Overwrite existing requirements.txt
+    --use-local           Use ONLY local package info instead of querying PyPI
+    --pypi-server         Use custom PyPi server
+    --proxy               Use Proxy, parameter will be passed to requests library. You can also just set the
+                          environments parameter in your terminal:
+                          $ export HTTP_PROXY="http://10.10.1.10:3128"
+                          $ export HTTPS_PROXY="https://10.10.1.10:1080"
+    --debug               Print debug information
+    --ignore <dirs>...    Ignore extra directories, each separated by a comma
+    --encoding <charset>  Use encoding parameter for file open
+    --savepath <file>     Save the list of requirements in the given file
+    --force               Overwrite existing requirements.txt
 """
 from __future__ import print_function, absolute_import
 import os
 import sys
 import re
 import logging
-
+import codecs
+import ast
+import traceback
 from docopt import docopt
 import requests
 from yarg import json2package
@@ -31,11 +38,24 @@ REGEXP = [
     re.compile(r'^from ((?!\.+).*?) import (?:.*)$')
 ]
 
+if sys.version_info[0] > 2:
+    open_func = open
+else:
+    open_func = codecs.open
 
-def get_all_imports(path):
-    imports = []
+
+def get_all_imports(path, encoding=None, extra_ignore_dirs=None):
+    imports = set()
+    raw_imports = set()
     candidates = []
-    ignore_dirs = [".hg", ".svn", ".git", "__pycache__", "env"]
+    ignore_errors = False
+    ignore_dirs = [".hg", ".svn", ".git", "__pycache__", "env", "venv"]
+
+    if extra_ignore_dirs:
+        ignore_dirs_parsed = []
+        for e in extra_ignore_dirs:
+            ignore_dirs_parsed.append(os.path.basename(os.path.realpath(e)))
+        ignore_dirs.extend(ignore_dirs_parsed)
 
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if d not in ignore_dirs]
@@ -45,17 +65,34 @@ def get_all_imports(path):
 
         candidates += [os.path.splitext(fn)[0] for fn in files]
         for file_name in files:
-            with open(os.path.join(root, file_name), "r") as f:
-                lines = filter(
-                    filter_line, map(lambda l: l.partition("#")[0].strip(), f))
-                for line in lines:
-                    if "(" in line:
-                        break
-                    for rex in REGEXP:
-                        s = rex.findall(line)
-                        for item in s:
-                            res = map(get_name_without_alias, item.split(","))
-                            imports = imports + [x for x in res if len(x) > 0]
+            with open_func(os.path.join(root, file_name), "r", encoding=encoding) as f:
+                contents = f.read()
+                try:
+                    tree = ast.parse(contents)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for subnode in node.names:
+                                raw_imports.add(subnode.name)
+                        elif isinstance(node, ast.ImportFrom):
+                            raw_imports.add(node.module)
+                except Exception as exc:
+                    if ignore_errors:
+                        traceback.print_exc(exc)
+                        logging.warn("Failed on file: %s" % os.path.join(root, file_name))
+                        continue
+                    else:
+                        logging.error("Failed on file: %s" % os.path.join(root, file_name))
+                        raise exc
+
+
+
+    # Clean up imports
+    for name in [n for n in raw_imports if n]:
+        # Sanity check: Name could have been None if the import statement was as from . import X
+        # Cleanup: We only want to first part of the import.
+        # Ex: from django.conf --> django.conf. But we only want django as an import
+        cleaned_name, _, _ = name.partition('.')
+        imports.add(cleaned_name)
 
     packages = set(imports) - set(set(candidates) & set(imports))
     logging.debug('Found packages: {0}'.format(packages))
@@ -94,7 +131,7 @@ def get_imports_info(imports, pypi_server="https://pypi.python.org/pypi/", proxy
                     data = json2package(response.content)
             elif response.status_code >= 300:
                 raise HTTPError(status_code=response.status_code,
-                        reason=response.reason)
+                                reason=response.reason)
         except HTTPError:
             logging.debug(
                 'Package %s does not exist or network problems', item)
@@ -103,15 +140,15 @@ def get_imports_info(imports, pypi_server="https://pypi.python.org/pypi/", proxy
     return result
 
 
-def get_locally_installed_packages():
+def get_locally_installed_packages(encoding=None):
     packages = {}
     ignore = ["tests", "_tests", "egg", "EGG", "info"]
     for path in sys.path:
         for root, dirs, files in os.walk(path):
             for item in files:
                 if "top_level" in item:
-                    with open(os.path.join(root, item), "r") as f:
-                        package = root.split("/")[-1].split("-")
+                    with open_func(os.path.join(root, item), "r", encoding=encoding) as f:
+                        package = root.split(os.sep)[-1].split("-")
                         try:
                             package_import = f.read().strip().split("\n")
                         except:
@@ -120,13 +157,13 @@ def get_locally_installed_packages():
                             if ((i_item not in ignore) and
                                     (package[0] not in ignore)):
                                 packages[i_item] = {
-                                    'version': package[1].replace(".dist", ""),
+                                    'version': package[1].replace(".dist", "").replace(".egg",""),
                                     'name': package[0]
                                 }
     return packages
 
 
-def get_import_local(imports):
+def get_import_local(imports, encoding=None):
     local = get_locally_installed_packages()
     result = []
     for item in imports:
@@ -145,7 +182,8 @@ def get_pkg_names(pkgs):
                 if item[0] == pkg:
                     toappend = item[1]
                     break
-            result.append(toappend)
+            if toappend not in result:
+                result.append(toappend)
     return result
 
 
@@ -162,7 +200,15 @@ def join(f):
 
 
 def init(args):
-    candidates = get_all_imports(args['<path>'])
+    encoding = args.get('--encoding')
+    extra_ignore_dirs = args.get('--ignore')
+
+    if extra_ignore_dirs:
+        extra_ignore_dirs = extra_ignore_dirs.split(',')
+
+    candidates = get_all_imports(args['<path>'], 
+                                 encoding=encoding,
+                                 extra_ignore_dirs = extra_ignore_dirs)
     candidates = get_pkg_names(candidates)
     logging.debug("Found imports: " + ", ".join(candidates))
     pypi_server = "https://pypi.python.org/pypi/"
@@ -171,15 +217,15 @@ def init(args):
         pypi_server = args["--pypi-server"]
 
     if args["--proxy"]:
-        proxy = {'http':args["--proxy"], 'https':args["--proxy"]}
+        proxy = {'http': args["--proxy"], 'https': args["--proxy"]}
 
     if args["--use-local"]:
         logging.debug(
             "Getting package information ONLY from local installation.")
-        imports = get_import_local(candidates)
+        imports = get_import_local(candidates, encoding=encoding)
     else:
         logging.debug("Getting packages information from Local/PyPI")
-        local = get_import_local(candidates)
+        local = get_import_local(candidates, encoding=encoding)
         # Get packages that were not found locally
         difference = [x for x in candidates
                       if x.lower() not in [z['name'].lower() for z in local]]
@@ -189,7 +235,6 @@ def init(args):
 
     path = (args["--savepath"] if args["--savepath"] else
             os.path.join(args['<path>'], "requirements.txt"))
-
 
     if not args["--savepath"] and not args["--force"] and os.path.exists(path):
         logging.warning("Requirements.txt already exists, "
@@ -201,7 +246,7 @@ def init(args):
 
 def main():  # pragma: no cover
     args = docopt(__doc__, version=__version__)
-    log_level = logging.DEBUG if args['--debug'] else logging.WARNING
+    log_level = logging.DEBUG if args['--debug'] else logging.INFO
     logging.basicConfig(level=log_level, format='%(levelname)s: %(message)s')
 
     try:

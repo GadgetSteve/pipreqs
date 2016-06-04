@@ -3,6 +3,41 @@
 History
 -------
 
+0.4.2 (2016-02-10)
+---------------------
+
+* Fix duplicated lines in requirements.txt (Dmitry Pribysh)
+
+0.4.1 (2016-02-05)
+---------------------
+
+* Added ignore option (Nick Rhinehart)
+
+0.4.0 (2016-01-28)
+---------------------
+
+* Walk Abstract Syntax Tree to find imports (Kay Sackey)
+
+0.3.9 (2016-01-20)
+---------------------
+
+* Fix regex for docstring comments (#35)
+
+0.3.8 (2016-01-12)
+---------------------
+
+* Add more package mapping
+* fix(pipreqs/mapping): remove pylab reference to matplotlib
+* Remove comments """ before going through imports
+* Update proxy documentation
+
+0.3.1 (2015-10-20)
+---------------------
+
+* fixed lint warnings (EJ Lee)
+* add --encoding parameter for open() (EJ Lee)
+* support windows directory separator (EJ Lee)
+
 0.3.0 (2015-09-29)
 ---------------------
 
